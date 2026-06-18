@@ -173,6 +173,11 @@ class RTCSession extends EventManager implements Owner {
   Timer? _iceDisconnectTimer;
   bool _isAttemptingIceRestart = false;
 
+  // COM-130: true while the app's audio is seized by the OS (e.g. a native
+  // cellular call). An ICE Failed during this window is treated as transient
+  // and its immediate teardown is suppressed.
+  bool _audioInterrupted = false;
+
   // SIP Timers.
   final SIPTimers _timers = SIPTimers();
 
@@ -1889,7 +1894,58 @@ class RTCSession extends EventManager implements Owner {
           'optional': <dynamic>[],
         };
     offerConstraints['mandatory']['IceRestart'] = true;
-    renegotiate(options: offerConstraints);
+    final bool started = renegotiate(options: offerConstraints);
+    logger.i('COM-130: ICE restart renegotiate started=$started');
+    if (!started) {
+      // The re-offer could not be sent yet (pending transaction / not
+      // established). Reset the flag so a later recovery attempt is not
+      // permanently blocked.
+      _isAttemptingIceRestart = false;
+    }
+  }
+
+  /// COM-130: called from the app layer (audio-interruption detection).
+  /// While interrupted (true), the immediate teardown on ICE Failed is
+  /// suppressed; when the interruption ends (false), if ICE is failed/
+  /// disconnected an ICE restart is attempted to recover the media.
+  void setAudioInterrupted(bool interrupted) {
+    if (_audioInterrupted == interrupted) {
+      return;
+    }
+    logger.i('COM-130: setAudioInterrupted=$interrupted (localHold=$_localHold)');
+    _audioInterrupted = interrupted;
+    if (interrupted) {
+      return;
+    }
+    // Interruption ended. Do nothing if the session is already terminated.
+    if (_state == RtcSessionState.terminated ||
+        _state == RtcSessionState.canceled) {
+      return;
+    }
+    // If we auto-held for COM-130, release the hold (stops PBX MoH, restores
+    // two-way audio). Combine the un-hold and ICE restart into a single
+    // re-INVITE to avoid two overlapping re-INVITE transactions.
+    final bool wasHeld = _localHold;
+    if (wasHeld) {
+      _localHold = false;
+      _onunhold(Originator.local);
+    }
+    // Recover the media path with a single ICE-restart renegotiation (the offer
+    // is sendrecv since _localHold is now false), whether due to a failed/
+    // disconnected ICE state or because we just released the hold.
+    final RTCIceConnectionState? ice = _connection?.iceConnectionState;
+    final bool needsRecovery =
+        ice == RTCIceConnectionState.RTCIceConnectionStateFailed ||
+            ice == RTCIceConnectionState.RTCIceConnectionStateDisconnected;
+    if ((wasHeld || needsRecovery) && !_isAttemptingIceRestart) {
+      logger.i(
+          'COM-130: interruption ended - resume (unhold=$wasHeld, ice=$ice) '
+          'via single ICE-restart re-INVITE.');
+      _iceDisconnectTimer?.cancel();
+      _iceDisconnectTimer = null;
+      _isAttemptingIceRestart = true;
+      _iceRestart();
+    }
   }
 
   Future<void> _createRTCConnection(Map<String, dynamic> pcConfig,
@@ -1905,6 +1961,16 @@ class RTCSession extends EventManager implements Owner {
       }
 
       if (state == RTCIceConnectionState.RTCIceConnectionStateFailed) {
+        // COM-130: an ICE Failed during an audio interruption (e.g. native
+        // call) is treated as transient; suppress the immediate teardown. The
+        // media is recovered via ICE restart when the interruption ends
+        // (setAudioInterrupted(false)).
+        if (_audioInterrupted) {
+          logger.w(
+              'COM-130: ICE Failed during audio interruption - suppressing '
+              'teardown, will attempt ICE restart on resume.');
+          return;
+        }
         logger.e('ICE Connection State Failed.');
         _iceDisconnectTimer?.cancel();
         terminate(<String, dynamic>{

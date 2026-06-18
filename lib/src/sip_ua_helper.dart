@@ -659,6 +659,15 @@ class Call {
     _session.unmute(audio, video);
   }
 
+  /// COM-130: forwards the audio-interruption state (e.g. native call) to the
+  /// session. Suppresses the immediate teardown on ICE Failed during the
+  /// interruption and recovers the media when it ends.
+  void setAudioInterrupted(bool interrupted) {
+    assert(
+        _session != null, 'ERROR(setAudioInterrupted): rtc session is invalid!');
+    _session.setAudioInterrupted(interrupted);
+  }
+
   void renegotiate({
     required Map<String, dynamic>? options,
     bool useUpdate = false,
