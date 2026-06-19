@@ -1917,30 +1917,30 @@ class RTCSession extends EventManager implements Owner {
     if (interrupted) {
       return;
     }
-    // Interruption ended. Do nothing if the session is already terminated.
-    if (_state == RtcSessionState.terminated ||
-        _state == RtcSessionState.canceled) {
-      return;
-    }
+    // Decision is in com130.dart (resumeAfterInterruptionDecision) — the single
+    // source of truth that unit tests exercise directly.
+    final RTCIceConnectionState? ice = _connection?.iceConnectionState;
+    final ResumeAfterInterruption decision = resumeAfterInterruptionDecision(
+      terminated: _state == RtcSessionState.terminated ||
+          _state == RtcSessionState.canceled,
+      localHold: _localHold,
+      iceFailedOrDisconnected:
+          ice == RTCIceConnectionState.RTCIceConnectionStateFailed ||
+              ice == RTCIceConnectionState.RTCIceConnectionStateDisconnected,
+      isAttemptingIceRestart: _isAttemptingIceRestart,
+    );
     // If we auto-held for COM-130, release the hold (stops PBX MoH, restores
-    // two-way audio). Combine the un-hold and ICE restart into a single
-    // re-INVITE to avoid two overlapping re-INVITE transactions.
-    final bool wasHeld = _localHold;
-    if (wasHeld) {
+    // two-way audio). The un-hold + ICE restart are combined into a single
+    // re-INVITE (offer is sendrecv since _localHold becomes false) to avoid two
+    // overlapping re-INVITE transactions.
+    if (decision.unhold) {
       _localHold = false;
       _onunhold(Originator.local);
     }
-    // Recover the media path with a single ICE-restart renegotiation (the offer
-    // is sendrecv since _localHold is now false), whether due to a failed/
-    // disconnected ICE state or because we just released the hold.
-    final RTCIceConnectionState? ice = _connection?.iceConnectionState;
-    final bool needsRecovery =
-        ice == RTCIceConnectionState.RTCIceConnectionStateFailed ||
-            ice == RTCIceConnectionState.RTCIceConnectionStateDisconnected;
-    if ((wasHeld || needsRecovery) && !_isAttemptingIceRestart) {
+    if (decision.iceRestart) {
       logger.i(
-          'COM-130: interruption ended - resume (unhold=$wasHeld, ice=$ice) '
-          'via single ICE-restart re-INVITE.');
+          'COM-130: interruption ended - resume (unhold=${decision.unhold}, '
+          'ice=$ice) via single ICE-restart re-INVITE.');
       _iceDisconnectTimer?.cancel();
       _iceDisconnectTimer = null;
       _isAttemptingIceRestart = true;
@@ -1964,8 +1964,8 @@ class RTCSession extends EventManager implements Owner {
         // COM-130: an ICE Failed during an audio interruption (e.g. native
         // call) is treated as transient; suppress the immediate teardown. The
         // media is recovered via ICE restart when the interruption ends
-        // (setAudioInterrupted(false)).
-        if (_audioInterrupted) {
+        // (setAudioInterrupted(false)). Decision lives in com130.dart.
+        if (!shouldTeardownOnIceFailed(audioInterrupted: _audioInterrupted)) {
           logger.w(
               'COM-130: ICE Failed during audio interruption - suppressing '
               'teardown, will attempt ICE restart on resume.');
