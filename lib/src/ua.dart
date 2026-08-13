@@ -582,7 +582,27 @@ class UA extends EventManager {
    * Registered
    */
   void registered({required dynamic response}) {
-    dynamic contact = response.headers?['Contact'][0]['raw'] as String?;
+    // COM-283: The 200 OK lists every active binding for the AOR, not just
+    // ours. Blindly taking the first entry can report another (possibly dead)
+    // registration's contact as our own; publishing that contact makes the
+    // server dial a binding we do not own, so the incoming INVITE never
+    // reaches this client. Pick the binding whose user part matches our own
+    // contact URI, falling back to the first entry.
+    dynamic contact;
+    final String? ownUser = _contact?.uri?.user ?? _configuration.contact_uri?.user;
+    final dynamic contacts = response.headers?['Contact'];
+    if (contacts is List && contacts.isNotEmpty) {
+      if (ownUser != null && ownUser.isNotEmpty) {
+        for (final dynamic entry in contacts) {
+          final String? raw = entry['raw'] as String?;
+          if (raw != null && raw.contains(ownUser)) {
+            contact = raw;
+            break;
+          }
+        }
+      }
+      contact ??= contacts[0]['raw'] as String?;
+    }
     _registeredContact = contact;
     emit(EventRegistered(
         cause: ErrorCause(
