@@ -592,7 +592,29 @@ class UA extends EventManager {
     final String? ownUser = _contact?.uri?.user ?? _configuration.contact_uri?.user;
     final dynamic contacts = response.headers?['Contact'];
     if (contacts is List && contacts.isNotEmpty) {
-      if (ownUser != null && ownUser.isNotEmpty) {
+      // ⚠️ 既知の限界（PR #47 レビュー指摘）: アプリが contact_uri を
+      // 'sip:<sipUsername>@<host>' に固定しているため、user 部は同一 AOR の
+      // すべてのバインディングで共通であり、自分のものを一意に特定できない。
+      // 複数バインディングがある場合、この一致は先頭一致に退化する。
+      // 正しく判別するには contact URI 全体（host・port・パラメータを含む）を
+      // 比較する必要があるが、実際の 200 OK に何が並ぶかを未確認のため、
+      // まず生ヘッダを記録して裏取りする。
+      logger.i('COM283-DIAG[register-200-contacts]: '
+          'own=${_contact?.uri} count=${contacts.length} '
+          'raw=${contacts.map((dynamic e) => e['raw']).toList()}');
+      final String? ownUri = _contact?.uri?.toString();
+      if (ownUri != null && ownUri.isNotEmpty) {
+        // まず URI 全体の一致を試す（別セッションのバインディングを誤って
+        // 自分のものとして publish しないため）。
+        for (final dynamic entry in contacts) {
+          final String? raw = entry['raw'] as String?;
+          if (raw != null && raw.contains(ownUri)) {
+            contact = raw;
+            break;
+          }
+        }
+      }
+      if (contact == null && ownUser != null && ownUser.isNotEmpty) {
         for (final dynamic entry in contacts) {
           final String? raw = entry['raw'] as String?;
           if (raw != null && raw.contains(ownUser)) {
