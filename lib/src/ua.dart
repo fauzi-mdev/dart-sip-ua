@@ -13,6 +13,7 @@ import 'exceptions.dart' as Exceptions;
 import 'logger.dart';
 import 'message.dart';
 import 'options.dart';
+import 'grammar.dart';
 import 'parser.dart' as Parser;
 import 'registrator.dart';
 import 'rtc_session.dart';
@@ -592,38 +593,51 @@ class UA extends EventManager {
     final String? ownUser = _contact?.uri?.user ?? _configuration.contact_uri?.user;
     final dynamic contacts = response.headers?['Contact'];
     if (contacts is List && contacts.isNotEmpty) {
-      // ⚠️ 既知の限界（PR #47 レビュー指摘）: アプリが contact_uri を
-      // 'sip:<sipUsername>@<host>' に固定しているため、user 部は同一 AOR の
-      // すべてのバインディングで共通であり、自分のものを一意に特定できない。
-      // 複数バインディングがある場合、この一致は先頭一致に退化する。
-      // 正しく判別するには contact URI 全体（host・port・パラメータを含む）を
-      // 比較する必要があるが、実際の 200 OK に何が並ぶかを未確認のため、
-      // まず生ヘッダを記録して裏取りする。
+      // 判別に使えるのは user 部だけである（実測 2026-08-14、本番 PBX）。
+      //   送信した Contact: <sip:9jfs0914@8hgt7nppenrx.invalid;transport=wss>
+      //                     ;reg-id=1;+sip.instance="<urn:uuid:...>"
+      //   200 OK の Contact: <sip:9jfs0914@127.0.0.1:59350;transport=WS>
+      //                     ;expires=599
+      // registrar は host・port・transport を書き換え、+sip.instance と reg-id を
+      // 落とすため、URI 全体の一致も instance-id による判別も成立しない。
+      // 一方 user 部は保持され、これは UA インスタンスごとのランダム token
+      // （dart-sip-ua が生成）なので、同一 AOR の他バインディングとは異なる。
+      //
+      // ⚠️ 前提: contact_uri が未設定でライブラリ生成の token が使われること。
+      // アプリは settings.contact_uri に 'sip:<sipUsername>@<host>' を渡している
+      // が、Settings.contact_uri は URI 型で、config.dart の loader は String の
+      // 場合しか dst に代入しないため、現状この指定は無視されている。もし将来
+      // これが有効になると user 部が AOR 共通の SIP アカウント名になり、
+      // 判別は成立しなくなる（先頭一致に退化する）。その場合はこの実装も
+      // 見直しが必要。
       logger.i('COM283-DIAG[register-200-contacts]: '
           'own=${_contact?.uri} count=${contacts.length} '
           'raw=${contacts.map((dynamic e) => e['raw']).toList()}');
-      final String? ownUri = _contact?.uri?.toString();
-      if (ownUri != null && ownUri.isNotEmpty) {
-        // まず URI 全体の一致を試す（別セッションのバインディングを誤って
-        // 自分のものとして publish しないため）。
+      if (ownUser != null && ownUser.isNotEmpty) {
         for (final dynamic entry in contacts) {
           final String? raw = entry['raw'] as String?;
-          if (raw != null && raw.contains(ownUri)) {
+          if (raw == null) {
+            continue;
+          }
+          // 部分一致ではなく user 部の完全一致で判定する（token が別の
+          // バインディングのパラメータ内に現れた場合の誤判定を避ける）。
+          final dynamic parsed = Grammar.parse(raw, 'Contact');
+          final dynamic uri = parsed is List && parsed.isNotEmpty
+              ? parsed[0]['parsed']?.uri
+              : null;
+          if (uri?.user == ownUser) {
             contact = raw;
             break;
           }
         }
       }
-      if (contact == null && ownUser != null && ownUser.isNotEmpty) {
-        for (final dynamic entry in contacts) {
-          final String? raw = entry['raw'] as String?;
-          if (raw != null && raw.contains(ownUser)) {
-            contact = raw;
-            break;
-          }
-        }
+      if (contact == null) {
+        // user 部で特定できなかった場合は従来どおり先頭を使うが、別セッションの
+        // バインディングを publish している可能性があるため記録する。
+        logger.w('COM283-DIAG[register-200-contacts]: own binding not found, '
+            'falling back to the first entry');
+        contact = contacts[0]['raw'] as String?;
       }
-      contact ??= contacts[0]['raw'] as String?;
     }
     _registeredContact = contact;
     emit(EventRegistered(
